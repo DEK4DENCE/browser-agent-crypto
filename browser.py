@@ -6,6 +6,7 @@ from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
 class BrowserManager:
     _instance: "BrowserManager | None" = None
+    _lock: asyncio.Lock | None = None
 
     def __init__(self):
         self._pw = None
@@ -14,9 +15,14 @@ class BrowserManager:
 
     @classmethod
     async def get(cls) -> "BrowserManager":
-        if cls._instance is None:
-            cls._instance = cls()
-            await cls._instance._init()
+        # Lazy-create the lock (can't create at class level — no event loop yet)
+        if cls._lock is None:
+            cls._lock = asyncio.Lock()
+        async with cls._lock:
+            if cls._instance is None:
+                instance = cls()
+                await instance._init()
+                cls._instance = instance  # only set AFTER init completes
         return cls._instance
 
     async def _init(self):

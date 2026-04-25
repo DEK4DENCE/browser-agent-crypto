@@ -35,6 +35,10 @@ async def run_research(
     await log(f"═══ Starting research sweep: {asset} ═══")
     await log("Initializing browser...")
 
+    # Eagerly init browser once before any concurrent scrapers touch it
+    from browser import BrowserManager
+    await BrowserManager.get()
+
     # ── Phase 1: Token metrics (CoinGecko + DefiLlama) ──────────────────
     await log("PHASE 1 → Token fundamentals (CoinGecko / DefiLlama)")
     try:
