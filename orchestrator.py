@@ -1,11 +1,9 @@
 import asyncio
 import os
 from typing import Callable, Awaitable
-import anthropic
+import llm
 from models import ResearchResult, TokenMetrics
 from scrapers import hyperliquid, coinglass, funding, twitter, hypurrscan
-
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 Log = Callable[[str], Awaitable[None]]
 
@@ -13,21 +11,12 @@ MAX_PARALLEL = int(os.getenv("MAX_PARALLEL_SCRAPERS", "5"))
 
 
 def parse_asset_from_query(query: str) -> str:
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=10,
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    f"Extract the crypto ticker symbol from this query: '{query}'. "
-                    "Reply with ONLY the ticker, uppercase, no $ sign, no explanation. "
-                    "Example: HYPE or BTC or ETH"
-                ),
-            }
-        ],
+    result = llm.quick(
+        f"Extract the crypto ticker symbol from this query: '{query}'. "
+        "Reply with ONLY the ticker, uppercase, no $ sign, no explanation. "
+        "Example: HYPE or BTC or ETH"
     )
-    return response.content[0].text.strip().upper().replace("$", "")
+    return result.strip().upper().replace("$", "")
 
 
 async def run_research(

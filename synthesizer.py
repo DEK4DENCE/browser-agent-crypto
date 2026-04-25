@@ -1,8 +1,5 @@
-import os
-import anthropic
 from models import ResearchResult
-
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+import llm
 
 SYSTEM = """You are a senior crypto analyst with deep expertise in on-chain data, derivatives markets, and smart money tracking.
 
@@ -57,24 +54,14 @@ Be specific. Use numbers. No disclaimers. If data is missing for a section, note
 def synthesize(result: ResearchResult) -> str:
     payload = result.model_dump_json(indent=2)
 
-    # Truncate if too large (keep within token limits)
     if len(payload) > 80000:
         payload = payload[:80000] + "\n... [truncated for length]"
 
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=4000,
-        system=SYSTEM,
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    f"Original query: {result.query}\n\n"
-                    f"Asset: {result.asset}\n"
-                    f"Timestamp: {result.timestamp}\n\n"
-                    f"Research data:\n{payload}"
-                ),
-            }
-        ],
+    user = (
+        f"Original query: {result.query}\n\n"
+        f"Asset: {result.asset}\n"
+        f"Timestamp: {result.timestamp}\n\n"
+        f"Research data:\n{payload}"
     )
-    return response.content[0].text
+
+    return llm.chat(SYSTEM, user, max_tokens=4000)
