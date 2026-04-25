@@ -1,0 +1,27 @@
+# Environment — never commit real keys
+.env
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Generated reports
+report_*.md
+
+# Browser session cookies (may contain login tokens)
+cookies.json
+
+# IDE / OS
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+
+# Claude Code local settings
+.claude/settings.local.json

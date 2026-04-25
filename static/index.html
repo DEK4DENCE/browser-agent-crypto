@@ -1,0 +1,792 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CRYPTO AGENT — Browser Intelligence Terminal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:       #050507;
+    --bg1:      #0A0A0F;
+    --bg2:      #0F0F17;
+    --border:   #1C1C2E;
+    --border2:  #2A2A40;
+    --amber:    #FFB000;
+    --amber2:   #FF8C00;
+    --amber-dim:#3D2C00;
+    --cyan:     #00D4FF;
+    --cyan-dim: #003344;
+    --green:    #00FF88;
+    --green-dim:#003322;
+    --red:      #FF3355;
+    --red-dim:  #330011;
+    --text:     #C8B88A;
+    --text-dim: #4A4035;
+    --text-mid: #8A7A60;
+    --white:    #E8E0D0;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 13px;
+    line-height: 1.6;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* CRT scanline overlay */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0,0,0,0.08) 2px,
+      rgba(0,0,0,0.08) 4px
+    );
+    pointer-events: none;
+    z-index: 9999;
+  }
+
+  /* ── HEADER ─────────────────────────────────────────────── */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 24px;
+    border-bottom: 1px solid var(--border2);
+    background: var(--bg1);
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+
+  .logo {
+    font-family: 'Orbitron', monospace;
+    font-size: 18px;
+    font-weight: 900;
+    color: var(--amber);
+    letter-spacing: 4px;
+    text-shadow: 0 0 20px rgba(255,176,0,0.6), 0 0 40px rgba(255,176,0,0.3);
+  }
+
+  .logo span {
+    color: var(--cyan);
+    text-shadow: 0 0 20px rgba(0,212,255,0.6);
+  }
+
+  .header-meta {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    font-size: 11px;
+    color: var(--text-dim);
+    letter-spacing: 1px;
+  }
+
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-dim);
+    display: inline-block;
+    margin-right: 6px;
+  }
+
+  .status-dot.active { background: var(--green); box-shadow: 0 0 8px var(--green); animation: pulse 1.5s infinite; }
+  .status-dot.scanning { background: var(--amber); box-shadow: 0 0 8px var(--amber); animation: pulse 0.8s infinite; }
+  .status-dot.error { background: var(--red); box-shadow: 0 0 8px var(--red); }
+
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+  #asset-badge {
+    font-family: 'Orbitron', monospace;
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--cyan);
+    background: var(--cyan-dim);
+    border: 1px solid var(--cyan);
+    padding: 3px 10px;
+    letter-spacing: 2px;
+    display: none;
+  }
+
+  /* ── QUERY BAR ──────────────────────────────────────────── */
+  .query-bar {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg1);
+  }
+
+  .query-prompt {
+    color: var(--amber);
+    font-size: 18px;
+    font-weight: 700;
+    margin-right: 10px;
+    text-shadow: 0 0 10px rgba(255,176,0,0.5);
+    flex-shrink: 0;
+  }
+
+  #query-input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--white);
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 14px;
+    caret-color: var(--amber);
+    letter-spacing: 0.5px;
+  }
+
+  #query-input::placeholder { color: var(--text-dim); }
+
+  .run-btn {
+    background: var(--amber);
+    color: #000;
+    border: none;
+    font-family: 'Orbitron', monospace;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 3px;
+    padding: 10px 22px;
+    cursor: pointer;
+    transition: all 0.15s;
+    clip-path: polygon(8px 0%, 100% 0%, calc(100% - 8px) 100%, 0% 100%);
+    flex-shrink: 0;
+  }
+
+  .run-btn:hover { background: var(--amber2); transform: translateY(-1px); }
+  .run-btn:active { transform: translateY(0); }
+  .run-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* ── METRICS BAR ────────────────────────────────────────── */
+  .metrics-bar {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    border-bottom: 1px solid var(--border);
+    background: var(--bg1);
+  }
+
+  .metric-cell {
+    padding: 10px 16px;
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .metric-cell:last-child { border-right: none; }
+
+  .metric-label {
+    font-size: 9px;
+    letter-spacing: 2px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+  }
+
+  .metric-value {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text);
+    font-family: 'Orbitron', monospace;
+    transition: all 0.3s;
+  }
+
+  .metric-value.bull { color: var(--green); text-shadow: 0 0 10px rgba(0,255,136,0.4); }
+  .metric-value.bear { color: var(--red); text-shadow: 0 0 10px rgba(255,51,85,0.4); }
+  .metric-value.amber { color: var(--amber); text-shadow: 0 0 10px rgba(255,176,0,0.4); }
+
+  /* ── MAIN LAYOUT ────────────────────────────────────────── */
+  .main {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    height: calc(100vh - 200px);
+    min-height: 500px;
+  }
+
+  /* ── AGENT LOG ──────────────────────────────────────────── */
+  .log-panel {
+    border-right: 1px solid var(--border2);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg2);
+    flex-shrink: 0;
+  }
+
+  .panel-title {
+    font-size: 10px;
+    letter-spacing: 3px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+  }
+
+  .panel-pill {
+    font-size: 9px;
+    letter-spacing: 1px;
+    padding: 2px 8px;
+    border: 1px solid currentColor;
+  }
+
+  #log-count { color: var(--text-dim); }
+
+  #log-container {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px 16px;
+    scroll-behavior: smooth;
+  }
+
+  #log-container::-webkit-scrollbar { width: 4px; }
+  #log-container::-webkit-scrollbar-track { background: var(--bg); }
+  #log-container::-webkit-scrollbar-thumb { background: var(--border2); }
+
+  .log-entry {
+    display: flex;
+    gap: 10px;
+    padding: 3px 0;
+    animation: fadeSlide 0.3s ease;
+    border-bottom: 1px solid rgba(255,255,255,0.02);
+  }
+
+  @keyframes fadeSlide {
+    from { opacity: 0; transform: translateX(-8px); }
+    to   { opacity: 1; transform: translateX(0); }
+  }
+
+  .log-time {
+    color: var(--text-dim);
+    font-size: 11px;
+    flex-shrink: 0;
+    padding-top: 1px;
+  }
+
+  .log-text {
+    color: var(--text);
+    font-size: 12px;
+    word-break: break-word;
+  }
+
+  .log-entry.phase .log-text { color: var(--amber); font-weight: 600; }
+  .log-entry.warn  .log-text { color: var(--red); }
+  .log-entry.ok    .log-text { color: var(--green); }
+  .log-entry.synth .log-text { color: var(--cyan); font-style: italic; }
+
+  .log-idle {
+    color: var(--text-dim);
+    font-size: 12px;
+    padding: 20px 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .blink { animation: blink 1s step-end infinite; }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+
+  /* ── REPORT PANEL ───────────────────────────────────────── */
+  .report-panel {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  #report-container {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+    scroll-behavior: smooth;
+  }
+
+  #report-container::-webkit-scrollbar { width: 4px; }
+  #report-container::-webkit-scrollbar-track { background: var(--bg); }
+  #report-container::-webkit-scrollbar-thumb { background: var(--border2); }
+
+  .report-idle {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: var(--text-dim);
+    text-align: center;
+    gap: 16px;
+  }
+
+  .report-idle .big-icon {
+    font-family: 'Orbitron', monospace;
+    font-size: 48px;
+    font-weight: 900;
+    color: var(--border2);
+    letter-spacing: 4px;
+  }
+
+  .verdict-badge {
+    font-family: 'Orbitron', monospace;
+    font-size: 22px;
+    font-weight: 900;
+    letter-spacing: 4px;
+    padding: 12px 24px;
+    margin-bottom: 20px;
+    text-align: center;
+    clip-path: polygon(12px 0%, 100% 0%, calc(100% - 12px) 100%, 0% 100%);
+  }
+
+  .verdict-badge.STRONG_BUY  { background: var(--green); color: #000; box-shadow: 0 0 30px rgba(0,255,136,0.5); }
+  .verdict-badge.BUY         { background: #00aa55; color: #000; }
+  .verdict-badge.NEUTRAL     { background: var(--text-mid); color: #000; }
+  .verdict-badge.SELL        { background: #aa2200; color: #fff; }
+  .verdict-badge.STRONG_SELL { background: var(--red); color: #fff; box-shadow: 0 0 30px rgba(255,51,85,0.5); }
+
+  /* Report markdown rendering */
+  #report-content h2 {
+    font-size: 11px;
+    letter-spacing: 3px;
+    color: var(--amber);
+    text-transform: uppercase;
+    margin: 20px 0 8px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--amber-dim);
+  }
+
+  #report-content h2:first-child { margin-top: 0; }
+
+  #report-content p {
+    color: var(--text);
+    margin-bottom: 8px;
+    line-height: 1.7;
+    font-size: 12px;
+  }
+
+  #report-content li {
+    color: var(--text);
+    margin: 3px 0 3px 16px;
+    font-size: 12px;
+    list-style: none;
+    position: relative;
+  }
+
+  #report-content li::before {
+    content: '▸';
+    color: var(--amber);
+    position: absolute;
+    left: -16px;
+  }
+
+  #report-content strong { color: var(--white); font-weight: 600; }
+
+  #report-content code {
+    background: var(--bg2);
+    border: 1px solid var(--border2);
+    padding: 1px 5px;
+    color: var(--cyan);
+    font-size: 11px;
+  }
+
+  /* Scanning animation for report area */
+  .scanning-overlay {
+    display: none;
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(180deg,
+      transparent 0%,
+      rgba(255,176,0,0.03) 50%,
+      transparent 100%
+    );
+    animation: scanbeam 2s linear infinite;
+    pointer-events: none;
+  }
+
+  @keyframes scanbeam {
+    from { transform: translateY(-100%); }
+    to   { transform: translateY(200%); }
+  }
+
+  .report-panel { position: relative; }
+  .report-panel.active .scanning-overlay { display: block; }
+
+  /* ── FOOTER ─────────────────────────────────────────────── */
+  .footer {
+    border-top: 1px solid var(--border);
+    padding: 6px 24px;
+    background: var(--bg1);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 10px;
+    color: var(--text-dim);
+    letter-spacing: 1px;
+  }
+
+  #footer-status { transition: color 0.3s; }
+  #footer-status.active { color: var(--amber); }
+
+  /* ── RESPONSIVE ─────────────────────────────────────────── */
+  @media (max-width: 900px) {
+    .main { grid-template-columns: 1fr; }
+    .log-panel { border-right: none; border-bottom: 1px solid var(--border2); height: 40vh; }
+    .metrics-bar { grid-template-columns: repeat(3, 1fr); }
+  }
+</style>
+</head>
+<body>
+
+<!-- ── HEADER ──────────────────────────────────────────────── -->
+<header class="header">
+  <div class="logo">CRYPTO<span>AGENT</span></div>
+  <div class="header-meta">
+    <div>
+      <span class="status-dot" id="status-dot"></span>
+      <span id="status-text">IDLE</span>
+    </div>
+    <div id="asset-badge">—</div>
+    <div>BROWSER INTELLIGENCE TERMINAL</div>
+  </div>
+</header>
+
+<!-- ── QUERY BAR ────────────────────────────────────────────── -->
+<div class="query-bar">
+  <div class="query-prompt">&gt;</div>
+  <input
+    type="text"
+    id="query-input"
+    placeholder='should I ape HYPE right now?'
+    autocomplete="off"
+    spellcheck="false"
+  />
+  <button class="run-btn" id="run-btn" onclick="startResearch()">EXECUTE</button>
+</div>
+
+<!-- ── METRICS BAR ──────────────────────────────────────────── -->
+<div class="metrics-bar">
+  <div class="metric-cell">
+    <div class="metric-label">Asset</div>
+    <div class="metric-value amber" id="m-asset">—</div>
+  </div>
+  <div class="metric-cell">
+    <div class="metric-label">Long Bias</div>
+    <div class="metric-value" id="m-long">—</div>
+  </div>
+  <div class="metric-cell">
+    <div class="metric-label">Avg Funding 8h</div>
+    <div class="metric-value" id="m-funding">—</div>
+  </div>
+  <div class="metric-cell">
+    <div class="metric-label">Whale Signal</div>
+    <div class="metric-value" id="m-whale">—</div>
+  </div>
+  <div class="metric-cell">
+    <div class="metric-label">KOL Sentiment</div>
+    <div class="metric-value" id="m-kol">—</div>
+  </div>
+  <div class="metric-cell">
+    <div class="metric-label">Price USD</div>
+    <div class="metric-value" id="m-price">—</div>
+  </div>
+</div>
+
+<!-- ── MAIN ─────────────────────────────────────────────────── -->
+<div class="main">
+
+  <!-- Agent log -->
+  <div class="log-panel">
+    <div class="panel-header">
+      <div class="panel-title">Agent Log</div>
+      <span class="panel-pill" id="log-count" style="color:var(--text-dim); border-color:var(--text-dim)">0 events</span>
+    </div>
+    <div id="log-container">
+      <div class="log-idle">
+        <span class="blink" style="color:var(--amber)">█</span>
+        <span>Awaiting query — enter any question above and hit EXECUTE</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Report panel -->
+  <div class="report-panel" id="report-panel">
+    <div class="scanning-overlay"></div>
+    <div class="panel-header">
+      <div class="panel-title">Research Report</div>
+      <span class="panel-pill" id="report-pill" style="color:var(--text-dim); border-color:var(--text-dim)">PENDING</span>
+    </div>
+    <div id="report-container">
+      <div class="report-idle" id="report-idle">
+        <div class="big-icon">⬡</div>
+        <div style="font-size:11px;letter-spacing:2px">AWAITING ANALYSIS</div>
+        <div style="font-size:11px;color:var(--text-dim);max-width:280px;line-height:1.8">
+          The agent will scrape Hyperliquid, Coinglass, whale trackers,<br>
+          funding APIs, and X — then synthesize a full research doc.
+        </div>
+      </div>
+      <div id="report-content" style="display:none"></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ── FOOTER ─────────────────────────────────────────────────── -->
+<footer class="footer">
+  <div id="footer-status">READY</div>
+  <div>PLAYWRIGHT · CLAUDE SONNET 4 · HYPERLIQUID · COINGLASS · X</div>
+  <div id="footer-timer">—</div>
+</footer>
+
+<script>
+let eventSource = null;
+let logCount = 0;
+let startTime = null;
+let timerInterval = null;
+
+const statusDot  = document.getElementById('status-dot');
+const statusText = document.getElementById('status-text');
+const assetBadge = document.getElementById('asset-badge');
+const runBtn     = document.getElementById('run-btn');
+const logContainer = document.getElementById('log-container');
+const reportContent = document.getElementById('report-content');
+const reportIdle = document.getElementById('report-idle');
+const reportPanel = document.getElementById('report-panel');
+const reportPill = document.getElementById('report-pill');
+const footerStatus = document.getElementById('footer-status');
+const footerTimer = document.getElementById('footer-timer');
+
+document.getElementById('query-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') startResearch();
+});
+
+function setStatus(state, text) {
+  statusDot.className = 'status-dot ' + state;
+  statusText.textContent = text;
+}
+
+function addLog(text, type = 'info') {
+  // Remove idle placeholder on first log
+  const idle = logContainer.querySelector('.log-idle');
+  if (idle) idle.remove();
+
+  logCount++;
+  document.getElementById('log-count').textContent = logCount + ' events';
+
+  const now = new Date();
+  const ts = now.toTimeString().slice(0, 8);
+
+  const entry = document.createElement('div');
+  entry.className = 'log-entry ' + type;
+
+  const timeSpan = document.createElement('span');
+  timeSpan.className = 'log-time';
+  timeSpan.textContent = '[' + ts + ']';
+
+  const textSpan = document.createElement('span');
+  textSpan.className = 'log-text';
+  textSpan.textContent = text;
+
+  entry.appendChild(timeSpan);
+  entry.appendChild(textSpan);
+  logContainer.appendChild(entry);
+  logContainer.scrollTop = logContainer.scrollHeight;
+}
+
+function classifyLog(msg) {
+  if (msg.startsWith('═══')) return 'phase';
+  if (msg.startsWith('PHASE')) return 'phase';
+  if (msg.includes('[WARN]')) return 'warn';
+  if (msg.includes('complete') || msg.includes('Complete') || msg.includes('Found')) return 'ok';
+  if (msg.includes('Synthesiz')) return 'synth';
+  return 'info';
+}
+
+function updateMetrics(data) {
+  const longPct = data.long_bias_pct ?? 50;
+  const longEl = document.getElementById('m-long');
+  longEl.textContent = longPct.toFixed(0) + '% LONG';
+  longEl.className = 'metric-value ' + (longPct > 60 ? 'bull' : longPct < 40 ? 'bear' : '');
+
+  const fund = data.avg_funding_8h ?? 0;
+  const fundEl = document.getElementById('m-funding');
+  fundEl.textContent = (fund >= 0 ? '+' : '') + fund.toFixed(4) + '%';
+  fundEl.className = 'metric-value ' + (fund > 0.02 ? 'bear' : fund < -0.01 ? 'bull' : 'amber');
+
+  const whale = data.whale_signal ?? '—';
+  const whaleEl = document.getElementById('m-whale');
+  whaleEl.textContent = whale;
+  whaleEl.className = 'metric-value ' + (whale === 'ACCUMULATING' ? 'bull' : whale === 'DISTRIBUTING' ? 'bear' : 'amber');
+
+  const kol = data.kol_bullish_pct ?? 50;
+  const kolEl = document.getElementById('m-kol');
+  kolEl.textContent = kol.toFixed(0) + '% BULL';
+  kolEl.className = 'metric-value ' + (kol > 60 ? 'bull' : kol < 40 ? 'bear' : '');
+
+  const price = data.token_metrics?.price_usd;
+  const priceEl = document.getElementById('m-price');
+  priceEl.textContent = price ? '$' + price.toLocaleString(undefined, {maximumFractionDigits: 4}) : '—';
+  priceEl.className = 'metric-value amber';
+}
+
+function renderReport(markdownText, verdict) {
+  reportIdle.style.display = 'none';
+  reportContent.style.display = 'block';
+
+  // Simple markdown → HTML
+  let html = markdownText
+    .replace(/^## (.+)$/gm, '<h2>$1</h2>')
+    .replace(/^### (.+)$/gm, '<h2>$1</h2>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/^- (.+)$/gm, '<li>$1</li>')
+    .replace(/^\* (.+)$/gm, '<li>$1</li>')
+    .replace(/\n\n/g, '</p><p>')
+    .replace(/<\/li>\n<li>/g, '</li><li>');
+
+  // Wrap loose text in paragraphs
+  html = html.split('\n')
+    .map(line => line.startsWith('<') ? line : (line.trim() ? '<p>' + line + '</p>' : ''))
+    .join('\n');
+
+  // Extract and show verdict badge
+  let verdictClass = 'NEUTRAL';
+  let verdictText = 'NEUTRAL';
+  const verdictMatch = markdownText.match(/VERDICT[:\s]+(STRONG BUY|BUY|NEUTRAL|SELL|STRONG SELL)/i);
+  if (verdictMatch) {
+    verdictText = verdictMatch[1].toUpperCase();
+    verdictClass = verdictText.replace(' ', '_');
+  }
+
+  const badge = document.createElement('div');
+  badge.className = 'verdict-badge ' + verdictClass;
+  badge.textContent = verdictText;
+
+  reportContent.innerHTML = '';
+  reportContent.appendChild(badge);
+
+  const body = document.createElement('div');
+  body.innerHTML = html;
+  reportContent.appendChild(body);
+
+  // Scroll report to top
+  document.getElementById('report-container').scrollTop = 0;
+}
+
+async function startResearch() {
+  const query = document.getElementById('query-input').value.trim();
+  if (!query) return;
+
+  if (eventSource) { eventSource.close(); eventSource = null; }
+
+  // Reset UI
+  logContainer.innerHTML = '';
+  reportContent.innerHTML = '';
+  reportContent.style.display = 'none';
+  reportIdle.style.display = 'flex';
+  logCount = 0;
+  document.getElementById('log-count').textContent = '0 events';
+  reportPill.textContent = 'SCANNING';
+  reportPill.style.color = 'var(--amber)';
+  reportPill.style.borderColor = 'var(--amber)';
+
+  runBtn.disabled = true;
+  setStatus('scanning', 'SCANNING');
+  reportPanel.classList.add('active');
+  footerStatus.className = 'active';
+  footerStatus.textContent = 'AGENT RUNNING';
+
+  // Start timer
+  startTime = Date.now();
+  timerInterval = setInterval(() => {
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    const m = Math.floor(elapsed / 60).toString().padStart(2, '0');
+    const s = (elapsed % 60).toString().padStart(2, '0');
+    footerTimer.textContent = m + ':' + s;
+  }, 1000);
+
+  const url = `/research/stream?query=${encodeURIComponent(query)}`;
+  eventSource = new EventSource(url);
+
+  eventSource.addEventListener('start', e => {
+    const data = JSON.parse(e.data);
+    const asset = data.asset;
+    document.getElementById('m-asset').textContent = asset;
+    assetBadge.textContent = asset;
+    assetBadge.style.display = 'block';
+    addLog(`Query: "${query}"`, 'phase');
+    addLog(`Asset identified: ${asset}`, 'ok');
+  });
+
+  eventSource.addEventListener('log', e => {
+    const data = JSON.parse(e.data);
+    const msg = data.message || '';
+    addLog(msg, classifyLog(msg));
+  });
+
+  eventSource.addEventListener('complete', e => {
+    const data = JSON.parse(e.data);
+    clearInterval(timerInterval);
+    addLog('Research complete — report ready', 'ok');
+    addLog('Synthesis pass finished', 'synth');
+
+    updateMetrics(data);
+    renderReport(data.report, data.verdict);
+
+    setStatus('active', 'COMPLETE');
+    reportPanel.classList.remove('active');
+    runBtn.disabled = false;
+    reportPill.textContent = 'COMPLETE';
+    reportPill.style.color = 'var(--green)';
+    reportPill.style.borderColor = 'var(--green)';
+    footerStatus.className = '';
+    footerStatus.textContent = `Done in ${footerTimer.textContent}`;
+
+    eventSource.close();
+    eventSource = null;
+  });
+
+  eventSource.addEventListener('error', e => {
+    try {
+      const data = JSON.parse(e.data);
+      addLog('[ERROR] ' + data.message, 'warn');
+    } catch (_) {
+      addLog('[ERROR] Stream connection lost', 'warn');
+    }
+    clearInterval(timerInterval);
+    setStatus('error', 'ERROR');
+    reportPanel.classList.remove('active');
+    runBtn.disabled = false;
+    reportPill.textContent = 'ERROR';
+    reportPill.style.color = 'var(--red)';
+    reportPill.style.borderColor = 'var(--red)';
+    footerStatus.className = '';
+    footerStatus.textContent = 'Agent error — check logs';
+    if (eventSource) { eventSource.close(); eventSource = null; }
+  });
+
+  eventSource.onerror = () => {
+    if (eventSource && eventSource.readyState === EventSource.CLOSED) {
+      addLog('[WARN] Connection closed', 'warn');
+      clearInterval(timerInterval);
+      runBtn.disabled = false;
+      setStatus('', 'DISCONNECTED');
+    }
+  };
+}
+</script>
+</body>
+</html>
