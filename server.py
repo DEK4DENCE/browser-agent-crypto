@@ -3,10 +3,10 @@ import json
 import os
 from pathlib import Path
 from dotenv import load_dotenv
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
+from pydantic import BaseModel
 
 load_dotenv()
 
@@ -16,6 +16,31 @@ from browser import BrowserManager
 
 app = FastAPI(title="Crypto Browser Agent")
 
+# In-memory key store — populated from .env on startup, overridable via UI
+_runtime_keys: dict[str, str] = {
+    "GROQ_API_KEY":       os.getenv("GROQ_API_KEY", ""),
+    "DUNE_API_KEY":       os.getenv("DUNE_API_KEY", ""),
+    "BINANCE_API_KEY":    os.getenv("BINANCE_API_KEY", ""),
+    "ANTHROPIC_API_KEY":  os.getenv("ANTHROPIC_API_KEY", ""),
+    "GOOGLE_API_KEY":     os.getenv("GOOGLE_API_KEY", ""),
+}
+
+
+def get_key(name: str) -> str:
+    """Read a key — runtime store takes priority over env."""
+    return _runtime_keys.get(name) or os.getenv(name, "")
+
+
+class KeysPayload(BaseModel):
+    groq_api_key:      str | None = None
+    dune_api_key:      str | None = None
+    binance_api_key:   str | None = None
+    anthropic_api_key: str | None = None
+    google_api_key:    str | None = None
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+
 STATIC_DIR = Path(__file__).parent / "static"
 
 
@@ -23,6 +48,41 @@ STATIC_DIR = Path(__file__).parent / "static"
 async def index():
     html_path = STATIC_DIR / "index.html"
     return HTMLResponse(html_path.read_text(encoding="utf-8"))
+
+
+@app.post("/api/keys")
+async def set_keys(payload: KeysPayload):
+    """Receive API keys from the UI and store them in the runtime key store."""
+    mapping = {
+        "GROQ_API_KEY":      payload.groq_api_key,
+        "DUNE_API_KEY":      payload.dune_api_key,
+        "BINANCE_API_KEY":   payload.binance_api_key,
+        "ANTHROPIC_API_KEY": payload.anthropic_api_key,
+        "GOOGLE_API_KEY":    payload.google_api_key,
+    }
+    updated = []
+    for env_name, value in mapping.items():
+        if value and not value.startswith("•"):  # ignore masked placeholders
+            _runtime_keys[env_name] = value
+            # Also push into os.environ so llm.py picks it up
+            os.environ[env_name] = value
+            updated.append(env_name)
+
+    # Reload llm provider if Groq key changed
+    if "GROQ_API_KEY" in updated or "ANTHROPIC_API_KEY" in updated:
+        import importlib, llm
+        importlib.reload(llm)
+
+    return JSONResponse({"ok": True, "updated": updated})
+
+
+@app.get("/api/keys/status")
+async def keys_status():
+    """Report which keys are currently set (masked)."""
+    return JSONResponse({
+        k: ("set" if v else "missing")
+        for k, v in _runtime_keys.items()
+    })
 
 
 @app.get("/research/stream")

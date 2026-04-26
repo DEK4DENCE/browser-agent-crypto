@@ -1,13 +1,15 @@
 """
-Dune Analytics scraper — uses the Dune API v1.
-Get a free API key at https://dune.com/settings/api
+Dune Analytics — uses "Get Latest Query Result" endpoint.
+GET https://api.dune.com/api/v1/query/{query_id}/results
+No execution needed — returns cached results instantly, free tier safe.
 
-Known Hyperliquid query IDs (public dashboards):
-  3455783 — Hyperliquid perps: volume, fees, traders
-  3685970 — Hyperliquid top traders by PnL
-  3260847 — Hyperliquid open interest over time
-  3876543 — Hyperliquid liquidations
-Set DUNE_QUERY_IDS=3455783,3685970 in .env to override defaults.
+Known Hyperliquid query IDs (public, pre-run):
+  3525054 — HL Daily Volume
+  2891521 — HL Cumulative Stats
+  3196457 — HL Top Assets by OI
+
+Set DUNE_API_KEY in .env or via the web UI settings panel.
+Override query IDs: DUNE_QUERY_IDS=3525054,2891521,3196457
 """
 import asyncio
 import aiohttp
@@ -16,105 +18,103 @@ from typing import Callable, Awaitable
 
 Log = Callable[[str], Awaitable[None]]
 
-DUNE_API_BASE = "https://api.dune.com/api/v1"
-_TIMEOUT = aiohttp.ClientTimeout(total=60)
+DUNE_RESULTS_URL = "https://api.dune.com/api/v1/query/{query_id}/results"
+_TIMEOUT = aiohttp.ClientTimeout(total=20)
 
-# Default query IDs targeting Hyperliquid on-chain data
 DEFAULT_QUERY_IDS = [
-    3455783,  # Hyperliquid perps volume + fees
-    3685970,  # Top traders by PnL
+    "3525054",  # HL Daily Volume
+    "2891521",  # HL Cumulative Stats
+    "3196457",  # HL Top Assets by OI
 ]
 
 
-def _get_query_ids() -> list[int]:
+def _get_query_ids() -> list[str]:
     env_ids = os.getenv("DUNE_QUERY_IDS", "")
     if env_ids:
-        try:
-            return [int(x.strip()) for x in env_ids.split(",") if x.strip()]
-        except ValueError:
-            pass
+        return [x.strip() for x in env_ids.split(",") if x.strip()]
     return DEFAULT_QUERY_IDS
 
 
-async def _execute_query(session: aiohttp.ClientSession, api_key: str, query_id: int) -> dict | None:
-    """Execute a Dune query and poll for result."""
-    headers = {"X-DUNE-API-KEY": api_key, "Content-Type": "application/json"}
-
-    # POST to execute
+async def _fetch_latest_result(
+    session: aiohttp.ClientSession,
+    api_key: str,
+    query_id: str,
+) -> dict | None:
+    """
+    GET /api/v1/query/{query_id}/results — returns the last cached result.
+    No execution credits consumed, responds immediately.
+    """
+    url = DUNE_RESULTS_URL.format(query_id=query_id)
     try:
-        async with session.post(
-            f"{DUNE_API_BASE}/query/{query_id}/execute",
-            headers=headers,
-            json={"performance": "medium"},
+        async with session.get(
+            url,
+            params={"limit": 10},
+            headers={"x-dune-api-key": api_key},
         ) as r:
-            if r.status not in (200, 201):
-                return None
-            exec_data = await r.json()
-            execution_id = exec_data.get("execution_id")
-            if not execution_id:
-                return None
-    except Exception:
-        return None
-
-    # Poll for result (up to 30s)
-    for _ in range(15):
-        await asyncio.sleep(2)
-        try:
-            async with session.get(
-                f"{DUNE_API_BASE}/execution/{execution_id}/results",
-                headers=headers,
-            ) as r:
-                if r.status != 200:
-                    continue
-                data = await r.json()
-                state = data.get("state", "")
-                if state == "QUERY_STATE_COMPLETED":
-                    return data.get("result", {})
-                if state in ("QUERY_STATE_FAILED", "QUERY_STATE_CANCELLED"):
-                    return None
-        except Exception:
-            continue
-
-    return None
+            if r.status == 401:
+                return {"_error": "invalid_key"}
+            if r.status == 404:
+                return {"_error": f"query {query_id} not found or not public"}
+            if r.status != 200:
+                return {"_error": f"HTTP {r.status}"}
+            data = await r.json()
+            rows = data.get("result", {}).get("rows", [])
+            cols = data.get("result", {}).get("metadata", {}).get("column_names", [])
+            return {
+                "query_id": query_id,
+                "rows": rows,
+                "columns": cols,
+                "row_count": len(rows),
+            }
+    except Exception as e:
+        return {"_error": str(e)}
 
 
 async def fetch_dune_data(asset: str, log: Log = None) -> list[dict]:
     """
-    Run configured Dune queries and return rows of on-chain data.
-    Requires DUNE_API_KEY in .env.
+    Fetch latest results from all configured Dune queries.
+    Returns list of result dicts with rows.
     """
-    api_key = os.getenv("DUNE_API_KEY", "")
+    # Key can come from env or runtime store (set via /api/keys endpoint)
+    from server import get_key  # import at call time to avoid circular import
+    api_key = get_key("DUNE_API_KEY")
+
     if not api_key:
         if log:
-            await log("[WARN] Dune: DUNE_API_KEY not set — get a free key at dune.com/settings/api")
+            await log("[WARN] Dune: DUNE_API_KEY not set — add it in ⚙ settings or .env")
         return []
 
     query_ids = _get_query_ids()
     if log:
-        await log(f"Running {len(query_ids)} Dune queries for {asset} on-chain data...")
+        await log(f"Fetching {len(query_ids)} Dune queries (cached results, no credits used)...")
 
     all_rows: list[dict] = []
 
     async with aiohttp.ClientSession(timeout=_TIMEOUT) as session:
-        tasks = [_execute_query(session, api_key, qid) for qid in query_ids]
+        tasks = [_fetch_latest_result(session, api_key, qid) for qid in query_ids]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         for qid, result in zip(query_ids, results):
-            if isinstance(result, Exception) or result is None:
+            if isinstance(result, Exception):
                 if log:
-                    await log(f"  [WARN] Dune query {qid}: no data")
+                    await log(f"  [WARN] Dune query {qid}: {result}")
+                continue
+            if result is None or result.get("_error"):
+                err = result.get("_error", "no data") if result else "no data"
+                if log:
+                    await log(f"  [WARN] Dune query {qid}: {err}")
                 continue
             rows = result.get("rows", [])
             if log:
-                await log(f"  Dune query {qid}: {len(rows)} rows")
-            for row in rows[:20]:
+                await log(f"  ✓ Dune {qid}: {len(rows)} rows — {result.get('columns', [])}")
+            for row in rows:
                 row["_query_id"] = qid
                 all_rows.append(row)
 
     if log:
         if all_rows:
-            await log(f"Dune: {len(all_rows)} total data rows retrieved")
+            await log(f"✓ Dune: {len(all_rows)} total data points retrieved")
         else:
-            await log("Dune: no data returned — verify DUNE_API_KEY and query IDs are correct")
+            await log("[WARN] Dune: no data — queries may need to be run on dune.com first")
 
     return all_rows
