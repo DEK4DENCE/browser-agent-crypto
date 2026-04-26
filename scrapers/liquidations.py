@@ -1,6 +1,12 @@
 """
-Exchange liquidation order scrapers — all called from Python (aiohttp),
+Exchange data scrapers — all called from Python (aiohttp),
 never from inside a browser page, so no CORS issues.
+
+Binance public futures endpoints (no API key needed):
+  - takerlongshortRatio — taker buy vs sell volume
+  - topLongShortPositionRatio — top trader position bias
+  - openInterestHist — historical open interest
+  - fundingRate — historical funding rates
 """
 import asyncio
 import aiohttp
@@ -11,60 +17,69 @@ Log = Callable[[str], Awaitable[None]]
 
 _TIMEOUT = aiohttp.ClientTimeout(total=12)
 
-BINANCE_SYMBOLS_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-BINANCE_LIQ_URL    = "https://fapi.binance.com/fapi/v1/forceOrders"
-BYBIT_LIQ_URL      = "https://api.bybit.com/v5/market/recent-trade"
-OKX_LIQ_URL        = "https://www.okx.com/api/v5/public/liquidation-orders"
-HL_INFO_URL        = "https://api.hyperliquid.xyz/info"
+BINANCE_FUTURES_BASE = "https://fapi.binance.com"
+BINANCE_SYMBOLS_URL  = f"{BINANCE_FUTURES_BASE}/fapi/v1/exchangeInfo"
+OKX_LIQ_URL          = "https://www.okx.com/api/v5/public/liquidation-orders"
+HL_INFO_URL          = "https://api.hyperliquid.xyz/info"
 
 
-async def _binance_has_perp(asset: str) -> bool:
-    """Check if asset trades as a USDT perp on Binance."""
+async def _binance_has_perp(session: aiohttp.ClientSession, asset: str) -> bool:
+    """Check if asset trades as a USDT perp on Binance futures."""
     symbol = f"{asset}USDT"
     try:
-        async with aiohttp.ClientSession(timeout=_TIMEOUT) as s:
-            async with s.get(BINANCE_SYMBOLS_URL) as r:
-                if r.status != 200:
-                    return False
-                data = await r.json()
-                syms = {x["symbol"] for x in data.get("symbols", [])}
-                return symbol in syms
+        async with session.get(BINANCE_SYMBOLS_URL) as r:
+            if r.status != 200:
+                return False
+            data = await r.json()
+            syms = {x["symbol"] for x in data.get("symbols", [])}
+            return symbol in syms
     except Exception:
         return False
 
 
 async def fetch_binance_liquidations(asset: str, log: Log = None) -> list[dict]:
-    """Fetch recent forced liquidation orders from Binance perps (Python call — no CORS)."""
+    """
+    Fetch Binance futures market data for the asset using public endpoints.
+    Returns taker ratios, top trader positioning, OI history, and funding.
+    No API key required — all public data endpoints.
+    """
     symbol = f"{asset}USDT"
+    results = []
 
-    # Check listing first — HYPE and many altcoins aren't on Binance perps
-    listed = await _binance_has_perp(asset)
-    if not listed:
+    async with aiohttp.ClientSession(timeout=_TIMEOUT) as s:
+        listed = await _binance_has_perp(s, asset)
+        if not listed:
+            if log:
+                await log(f"  Binance: {asset} not listed on futures — skipping")
+            return []
+
         if log:
-            await log(f"  Binance: {asset} not listed as perp — skipping Binance liq")
-        return []
+            await log(f"  ✓ Binance: {symbol} found on futures")
 
-    orders = []
-    try:
-        async with aiohttp.ClientSession(timeout=_TIMEOUT) as s:
-            async with s.get(
-                BINANCE_LIQ_URL,
-                params={"symbol": symbol, "limit": 100},
-                headers={"X-MBX-APIKEY": os.getenv("BINANCE_API_KEY", "")},
-            ) as r:
-                if r.status == 200:
-                    orders = await r.json()
-                elif r.status == 401:
-                    if log:
-                        await log("  Binance: API key required for forced orders — set BINANCE_API_KEY in .env")
-                else:
-                    if log:
-                        await log(f"  Binance liq: HTTP {r.status}")
-    except Exception as e:
-        if log:
-            await log(f"  [WARN] Binance liq fetch: {e}")
+        endpoints = [
+            ("futures/data/takerlongshortRatio", {"symbol": symbol, "period": "1h", "limit": 24}, "taker_ls_ratio"),
+            ("futures/data/topLongShortPositionRatio", {"symbol": symbol, "period": "1h", "limit": 24}, "top_trader_pos"),
+            ("futures/data/openInterestHist", {"symbol": symbol, "period": "1h", "limit": 24}, "oi_history"),
+            ("fapi/v1/fundingRate", {"symbol": symbol, "limit": 10}, "funding_hist"),
+        ]
 
-    return orders if isinstance(orders, list) else []
+        for path, params, tag in endpoints:
+            try:
+                async with s.get(f"{BINANCE_FUTURES_BASE}/{path}", params=params) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        if isinstance(data, list) and data:
+                            for row in data:
+                                row["_tag"] = tag
+                                row["_symbol"] = symbol
+                                results.append(row)
+                            if log:
+                                await log(f"  ✓ Binance {tag}: {len(data)} records")
+            except Exception as e:
+                if log:
+                    await log(f"  [WARN] Binance {tag}: {e}")
+
+    return results
 
 
 async def fetch_bybit_liquidations(asset: str, log: Log = None) -> list[dict]:

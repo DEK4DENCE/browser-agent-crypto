@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import time
 from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -9,6 +10,9 @@ from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel
 
 load_dotenv()
+
+RUNS_DIR = Path(__file__).parent / "runs"
+RUNS_DIR.mkdir(exist_ok=True)
 
 from orchestrator import run_research, parse_asset_from_query
 from synthesizer import synthesize
@@ -153,10 +157,15 @@ async def stream_research(query: str = "HYPE"):
                     "token_metrics": res.token_metrics.model_dump() if res else {},
                 }
                 yield {"event": "complete", "data": json.dumps(payload)}
-                # Save report to file
+                # Save report + run history
                 try:
                     report_path = Path(f"report_{asset}.md")
                     report_path.write_text(report, encoding="utf-8")
+                except Exception:
+                    pass
+                try:
+                    from orchestrator import _save_run
+                    _save_run(asset, query, report, res, [], 0)
                 except Exception:
                     pass
                 break
@@ -169,6 +178,39 @@ async def stream_research(query: str = "HYPE"):
             task.cancel()
 
     return EventSourceResponse(event_generator())
+
+
+@app.get("/api/history")
+async def get_history():
+    """Return list of past runs (summary only, newest first)."""
+    runs = []
+    for f in sorted(RUNS_DIR.glob("run_*.json"), reverse=True)[:50]:
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            runs.append({
+                "id": data.get("id"),
+                "timestamp": data.get("timestamp"),
+                "asset": data.get("asset"),
+                "query": data.get("query"),
+                "duration_secs": data.get("duration_secs"),
+                "error_count": len(data.get("errors", [])),
+                "metrics": data.get("metrics", {}),
+            })
+        except Exception:
+            pass
+    return JSONResponse(runs)
+
+
+@app.get("/api/history/{run_id}")
+async def get_run(run_id: str):
+    """Return full data for a specific past run."""
+    path = RUNS_DIR / f"run_{run_id}.json"
+    if not path.exists():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    try:
+        return JSONResponse(json.loads(path.read_text(encoding="utf-8")))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @app.on_event("shutdown")

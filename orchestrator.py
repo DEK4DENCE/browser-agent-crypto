@@ -1,23 +1,30 @@
 """
 Research orchestrator — 9-phase pipeline.
 All browser scrapers are called sequentially after eager browser init.
-Pure-API phases (funding, liquidations, Dune) run via aiohttp — no browser, no CORS.
+Pure-API phases (funding, liquidations, HL analytics) run via aiohttp — no browser, no CORS.
 """
 import asyncio
+import json
 import os
+import time
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable, Awaitable
 import aiohttp
 import llm
 from models import ResearchResult, TokenMetrics, FundingRate
 from scrapers import hyperliquid, coinglass, funding, twitter, hypurrscan
 from scrapers import liquidations as liq_scraper
-from scrapers import dune as dune_scraper
 
 Log = Callable[[str], Awaitable[None]]
 
 HL_API = "https://api.hyperliquid.xyz/info"
 CG_API = "https://api.coingecko.com/api/v3"
 _TIMEOUT = aiohttp.ClientTimeout(total=15)
+
+RUNS_DIR = Path(__file__).parent / "runs"
+RUNS_DIR.mkdir(exist_ok=True)
 
 # Known CT wallets to cross-reference
 CT_WALLETS: dict[str, str] = {
@@ -34,7 +41,6 @@ COINGECKO_IDS = {
 
 
 def parse_asset_from_query(query: str) -> str:
-    # If it's already just a ticker (1-6 uppercase chars), return as-is
     q = query.strip().upper().replace("$", "")
     if q.isalpha() and len(q) <= 6:
         return q
@@ -46,7 +52,6 @@ def parse_asset_from_query(query: str) -> str:
 
 
 async def _cg_price_history(coin_id: str, days: int = 30) -> list[float]:
-    """Fetch daily closing prices from CoinGecko."""
     try:
         async with aiohttp.ClientSession(timeout=_TIMEOUT) as s:
             async with s.get(
@@ -62,8 +67,6 @@ async def _cg_price_history(coin_id: str, days: int = 30) -> list[float]:
 
 
 async def _hl_candles(asset: str, interval: str = "1h", lookback: int = 168) -> list[dict]:
-    """Fetch OHLCV candles from Hyperliquid."""
-    import time
     now_ms = int(time.time() * 1000)
     interval_ms = {"1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}.get(interval, 3_600_000)
     start_ms = now_ms - (lookback * interval_ms)
@@ -85,12 +88,113 @@ async def _hl_candles(asset: str, interval: str = "1h", lookback: int = 168) -> 
 
 
 def _calc_sr(candles: list[dict]) -> tuple[float, float]:
-    """Simple S1/R1: lowest low and highest high of recent candles."""
     if not candles:
         return 0.0, 0.0
     lows = [float(c.get("l", c.get("low", 0))) for c in candles if c.get("l") or c.get("low")]
     highs = [float(c.get("h", c.get("high", 0))) for c in candles if c.get("h") or c.get("high")]
     return (min(lows) if lows else 0.0), (max(highs) if highs else 0.0)
+
+
+async def _fetch_hl_global_stats(session: aiohttp.ClientSession) -> dict:
+    """Derive platform-wide stats by summing across all assets in metaAndAssetCtxs."""
+    try:
+        async with session.post(
+            HL_API,
+            json={"type": "metaAndAssetCtxs"},
+            headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as r:
+            if r.status == 200:
+                data = await r.json()
+                if isinstance(data, list) and len(data) == 2:
+                    meta, ctxs = data[0], data[1]
+                    total_oi = sum(
+                        float(c.get("openInterest", 0)) * float(c.get("markPx", 0))
+                        for c in ctxs
+                    )
+                    total_vol = sum(float(c.get("dayNtlVlm", 0)) for c in ctxs)
+                    return {
+                        "totalOI": total_oi,
+                        "totalVol": total_vol,
+                        "totalAssets": len(meta.get("universe", [])),
+                    }
+    except Exception:
+        pass
+    return {}
+
+
+async def _fetch_hl_funding_history(session: aiohttp.ClientSession, asset: str) -> list[dict]:
+    start_ts = int((time.time() - 30 * 86400) * 1000)
+    try:
+        async with session.post(
+            HL_API,
+            json={"type": "fundingHistory", "coin": asset, "startTime": start_ts},
+            headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as r:
+            if r.status == 200:
+                data = await r.json()
+                return data if isinstance(data, list) else []
+    except Exception:
+        pass
+    return []
+
+
+async def _fetch_hl_asset_ctx(session: aiohttp.ClientSession, asset: str) -> dict:
+    try:
+        async with session.post(
+            HL_API,
+            json={"type": "metaAndAssetCtxs"},
+            headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as r:
+            if r.status == 200:
+                data = await r.json()
+                if isinstance(data, list) and len(data) == 2:
+                    meta, ctxs = data[0], data[1]
+                    coins = [u["name"] for u in meta.get("universe", [])]
+                    if asset in coins:
+                        idx = coins.index(asset)
+                        return ctxs[idx] if idx < len(ctxs) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_run(
+    asset: str,
+    query: str,
+    report: str,
+    result: "ResearchResult",
+    errors: list[str],
+    duration_secs: float,
+):
+    ts = int(time.time())
+    run_id = f"{ts}_{asset}"
+    data = {
+        "id": run_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "asset": asset,
+        "query": query,
+        "duration_secs": round(duration_secs, 1),
+        "report": report,
+        "errors": errors,
+        "metrics": {
+            "price_usd": result.token_metrics.price_usd,
+            "market_cap": result.token_metrics.market_cap,
+            "open_interest": result.token_metrics.open_interest,
+            "funding_rate_hl": result.token_metrics.funding_rate_hl,
+            "long_bias_pct": result.long_bias_pct,
+            "whale_signal": result.whale_signal,
+            "num_traders": len(result.top_traders),
+            "num_funding": len(result.funding_rates),
+        },
+    }
+    path = RUNS_DIR / f"run_{run_id}.json"
+    try:
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 
 async def run_research(
@@ -99,14 +203,25 @@ async def run_research(
     log_queue: asyncio.Queue | None = None,
 ) -> ResearchResult:
 
+    run_errors: list[str] = []
+    run_start = time.time()
+
     async def log(msg: str):
         print(f"[agent] {msg}")
         if log_queue is not None:
             await log_queue.put({"type": "log", "message": msg})
 
+    async def log_error(phase: str, exc: Exception):
+        tb = traceback.format_exc()
+        short = f"[ERROR] {phase}: {exc}"
+        detail = f"[ERROR] {phase}: {exc}\n{tb}"
+        run_errors.append(detail)
+        print(detail)
+        if log_queue is not None:
+            await log_queue.put({"type": "log", "message": short})
+
     result = ResearchResult(asset=asset, query=query)
 
-    # Eager browser init — must happen before any parallel browser calls
     from browser import BrowserManager
     await BrowserManager.get()
 
@@ -129,10 +244,7 @@ async def run_research(
                 f"24h {change:+.2f}% | ATH ${ath:,.4f}"
             )
         if tvl:
-            await log(
-                f"✓ DefiLlama: TVL ${tvl/1e9:.2f}B"
-                + (f" | Fees/day ${fees/1e6:.2f}M" if fees else "")
-            )
+            await log(f"✓ DefiLlama: TVL ${tvl/1e9:.2f}B" + (f" | Fees/day ${fees/1e6:.2f}M" if fees else ""))
         result.token_metrics = TokenMetrics(
             price_usd=cg_data.get("price_usd"),
             market_cap=cg_data.get("market_cap"),
@@ -142,7 +254,7 @@ async def run_research(
             fees_24h=fees,
         )
     except Exception as e:
-        await log(f"[WARN] Phase 1: {e}")
+        await log_error("Phase 1 (fundamentals)", e)
 
     # ── PHASE 1b: 30d relative performance ──────────────────────────────
     await log("PHASE 1b → 30d relative performance vs BTC / ETH / SOL")
@@ -179,16 +291,16 @@ async def run_research(
                 f"30d perf: {asset} {pc_asset:+.2f}% vs BTC {pc_btc:+.2f}% ETH {pc_eth:+.2f}% SOL {pc_sol:+.2f}%"
             )
     except Exception as e:
-        await log(f"[WARN] Phase 1b: {e}")
+        await log_error("Phase 1b (30d perf)", e)
 
     # ── PHASE 2: Funding rates ───────────────────────────────────────────
     await log("PHASE 2 → Funding rates (Binance / Bybit / OKX)")
     try:
         result.funding_rates = await funding.scrape_funding_rates(asset, log=log)
         for r_ in result.funding_rates:
-            await log(f"✓ {r_.exchange}: {r_.rate_8h:+.4f}%/8h | Mark —")
+            await log(f"✓ {r_.exchange}: {r_.rate_8h:+.4f}%/8h")
     except Exception as e:
-        await log(f"[WARN] Phase 2: {e}")
+        await log_error("Phase 2 (funding rates)", e)
 
     # ── PHASE 3: Hyperliquid OI & funding ────────────────────────────────
     await log("PHASE 3 → Hyperliquid OI & funding")
@@ -210,19 +322,21 @@ async def run_research(
                 f"Funding {hl_rate:+.4%}/8h | "
                 f"Vol ${hl_market.get('day_volume', 0)/1e6:.2f}M"
             )
+        else:
+            await log(f"[WARN] Phase 3: {asset} not found on Hyperliquid perps")
     except Exception as e:
-        await log(f"[WARN] Phase 3: {e}")
+        await log_error("Phase 3 (HL market data)", e)
 
     # ── PHASE 3b: Price chart & key levels ──────────────────────────────
     await log("PHASE 3b → Price chart data (72h candles)")
     try:
         candles_1h, candles_4h = await asyncio.gather(
-            _hl_candles(asset, "1h", 168),   # 7 days hourly
-            _hl_candles(asset, "4h", 180),   # 30 days 4h
+            _hl_candles(asset, "1h", 168),
+            _hl_candles(asset, "4h", 180),
         )
         s1_1h, r1_1h = _calc_sr(candles_1h)
         s1_4h, r1_4h = _calc_sr(candles_4h)
-        s1 = max(s1_1h, s1_4h * 0.98)   # tighter of the two
+        s1 = max(s1_1h, s1_4h * 0.98)
         r1 = min(r1_1h, r1_4h * 1.02) if r1_1h and r1_4h else (r1_1h or r1_4h)
         if candles_1h or candles_4h:
             await log(
@@ -238,8 +352,10 @@ async def run_research(
                     f"Chart: ENTRY ${price:,.4f} | STOP ${stop:,.4f} | TARGET ${target:,.4f}"
                 )
                 await log(f"Chart: ENTRY ${price:,.4f} | STOP ${stop:,.4f} | TARGET ${target:,.4f}")
+        else:
+            await log(f"[WARN] Phase 3b: No candle data returned for {asset}")
     except Exception as e:
-        await log(f"[WARN] Phase 3b: {e}")
+        await log_error("Phase 3b (candles)", e)
 
     # ── PHASE 4: Leaderboard + top 20 wallet positions ──────────────────
     await log("PHASE 4 → Hyperliquid leaderboard")
@@ -263,7 +379,6 @@ async def run_research(
         all_detailed = await asyncio.gather(*[fetch_profile(t) for t in traders])
         result.top_traders = list(all_detailed)
 
-        # Log positions found
         positions_with_asset = [(t, p) for t in result.top_traders for p in t.positions]
         whale_threshold = 100_000
         for trader, pos in positions_with_asset:
@@ -282,7 +397,7 @@ async def run_research(
             f"{whale_count} whale positions ≥$100K"
         )
     except Exception as e:
-        await log(f"[WARN] Phase 4: {e}")
+        await log_error("Phase 4 (leaderboard)", e)
 
     # ── PHASE 5: Known CT wallets ────────────────────────────────────────
     await log("PHASE 5 → Known CT / whale wallet scan")
@@ -303,66 +418,99 @@ async def run_research(
         else:
             await log("Known CT wallets: no open positions found (flat or addresses changed)")
 
-        # Liquidation cluster summary from top trader positions
         all_pos = [p for t in result.top_traders for p in t.positions]
         long_entries = [p.entry_price for p in all_pos if p.side == "LONG" and p.entry_price]
         short_entries = [p.entry_price for p in all_pos if p.side == "SHORT" and p.entry_price]
         long_cluster = min(long_entries) * 0.95 if long_entries else None
         short_cluster = max(short_entries) * 1.05 if short_entries else None
-        await log(
-            f"Liq clusters: Longs wash below ${long_cluster:,.2f}" if long_cluster else "Liq clusters: Longs wash below —",
-        )
-        await log(
-            f"  | Shorts above ${short_cluster:,.2f}" if short_cluster else "  | Shorts above —",
-        )
+        await log(f"Liq clusters: Longs wash below ${long_cluster:,.2f}" if long_cluster else "Liq clusters: Longs wash below —")
+        await log(f"  | Shorts above ${short_cluster:,.2f}" if short_cluster else "  | Shorts above —")
 
         longs = sum(1 for p in all_pos if p.side == "LONG")
         total = len(all_pos)
         await log(f"Position bias: {longs/total*100:.0f}% LONG ({total} positions)" if total else "Position bias: no positions")
-
     except Exception as e:
-        await log(f"[WARN] Phase 5: {e}")
+        await log_error("Phase 5 (CT wallets)", e)
 
     # ── PHASE 6: Coinglass liquidation heatmap ───────────────────────────
     await log("PHASE 6 → Coinglass liquidation heatmap")
     try:
         result.liquidation_zones = await coinglass.scrape_liquidation_zones(asset, log=log)
     except Exception as e:
-        await log(f"[WARN] Phase 6: {e}")
+        await log_error("Phase 6 (Coinglass)", e)
 
-    # ── PHASE 7: Exchange liquidation orders (Python, no CORS) ───────────
-    await log("PHASE 7 → Exchange liquidation orders (last 24h)")
+    # ── PHASE 7: Exchange data (Binance public + Bybit + OKX) ────────────
+    await log("PHASE 7 → Exchange market data (Binance / Bybit / OKX)")
     try:
         liq_data = await liq_scraper.fetch_all_liquidations(asset, log=log)
-        result.raw_notes.append(f"Liquidation orders: {liq_data['total']} events across exchanges")
+        result.raw_notes.append(f"Exchange data: {liq_data['total']} liq events | Binance metrics fetched")
     except Exception as e:
-        await log(f"[WARN] Phase 7: {e}")
+        await log_error("Phase 7 (exchange data)", e)
 
-    # ── PHASE 8: Dune Analytics ──────────────────────────────────────────
-    await log("PHASE 8 → Dune Analytics (on-chain Hyperliquid data)")
+    # ── PHASE 8: Hyperliquid Extended Analytics ──────────────────────────
+    await log("PHASE 8 → Hyperliquid extended analytics (global stats / funding history)")
     try:
-        dune_rows = await dune_scraper.fetch_dune_data(asset, log=log)
-        if dune_rows:
-            result.raw_notes.append(f"Dune on-chain data: {len(dune_rows)} rows")
-            for row in dune_rows[:3]:
-                result.raw_notes.append(str(row))
+        async with aiohttp.ClientSession() as session:
+            global_stats, funding_hist, asset_ctx = await asyncio.gather(
+                _fetch_hl_global_stats(session),
+                _fetch_hl_funding_history(session, asset),
+                _fetch_hl_asset_ctx(session, asset),
+            )
+
+        if global_stats:
+            total_oi = float(global_stats.get("totalOI", 0))
+            total_vol = float(global_stats.get("totalVol", 0))
+            total_assets = global_stats.get("totalAssets", 0)
+            await log(f"  ✓ HL Platform: OI ${total_oi/1e9:.2f}B | 24h vol ${total_vol/1e9:.2f}B | {total_assets} assets listed")
+            result.raw_notes.append(f"HL Platform: OI ${total_oi/1e9:.1f}B | 24h vol ${total_vol/1e9:.1f}B | {total_assets} assets")
+
+        if asset_ctx:
+            oi = float(asset_ctx.get("openInterest", 0))
+            vol = float(asset_ctx.get("dayNtlVlm", 0))
+            premium = float(asset_ctx.get("premium", 0))
+            await log(f"  ✓ HL {asset}: OI ${oi:,.0f} | 24h vol ${vol:,.0f} | Premium {premium:+.4%}")
+            result.raw_notes.append(f"HL {asset}: OI ${oi/1e6:.1f}M | 24h vol ${vol/1e6:.1f}M")
+        else:
+            await log(f"  [WARN] Phase 8: {asset} not found in metaAndAssetCtxs")
+
+        if funding_hist:
+            rates = [float(f.get("fundingRate", 0)) for f in funding_hist]
+            avg_r = sum(rates) / len(rates) if rates else 0
+            max_r = max(rates) if rates else 0
+            min_r = min(rates) if rates else 0
+            await log(
+                f"  ✓ HL 30d funding ({len(rates)} samples): "
+                f"avg {avg_r*100:.4f}% | max {max_r*100:.4f}% | min {min_r*100:.4f}%"
+            )
+            result.raw_notes.append(
+                f"30d funding: avg {avg_r*100:.4f}%/8h ({avg_r*100*3*365:.1f}% ann.) | "
+                f"max {max_r*100:.4f}% | min {min_r*100:.4f}%"
+            )
+        else:
+            await log(f"  [WARN] Phase 8: No funding history for {asset}")
+
     except Exception as e:
-        await log(f"[WARN] Phase 8: {e}")
+        await log_error("Phase 8 (HL analytics)", e)
 
     # ── PHASE 9: X/Twitter KOL sentiment ────────────────────────────────
     await log("PHASE 9 → X/Twitter KOL sentiment")
     try:
         result.kol_sentiment = await twitter.scrape_kol_sentiment(asset, hours=24, log=log)
     except Exception as e:
-        await log(f"[WARN] Phase 9: {e}")
+        await log_error("Phase 9 (KOL sentiment)", e)
 
     # ── Summary ──────────────────────────────────────────────────────────
+    duration = time.time() - run_start
+    error_count = len(run_errors)
     await log(
-        f"═══ Research complete ═══ "
+        f"═══ Research complete in {duration:.0f}s ═══ "
         f"Traders:{len(result.top_traders)} | "
         f"Funding:{len(result.funding_rates)} | "
         f"Liq zones:{len(result.liquidation_zones)} | "
-        f"KOLs:{len(result.kol_sentiment)}"
+        f"KOLs:{len(result.kol_sentiment)} | "
+        f"Errors:{error_count}"
     )
+    if run_errors:
+        await log(f"[ERRORS] {error_count} phase error(s) — check server.log for full tracebacks")
 
     return result
